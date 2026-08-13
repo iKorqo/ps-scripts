@@ -1,0 +1,87 @@
+$Files = @(
+    @{ Name = "Meow Resolver.exe"; Url = "https://github.com/MeowTonynoh/MeowResolver/releases/download/v.1.1/MeowResolver.exe" }      
+    @{ Name = "Meow Client Fucker.exe"; Url = "https://github.com/MeowTonynoh/MeowClientFucker/releases/download/v1.0/MeowClientFucker.exe" }        
+    @{ Name = "SSTool.exe"; Url = "https://github.com/Orbdiff/SSTool/releases/download/lol/SSTool.exe"; SubFolder = "Downloaders" }  
+    @{ Name = "RL Collector.exe"; Url = "https://github.com/ItzIceHere/RedLotus-Tool-Downloader/releases/download/RL/RedLotus.Downloader.exe"; SubFolder = "Downloaders" }  
+)
+$OutputFolder = "C:\SS"
+$Overwrite = $false
+$AddDefenderExclusion = $true
+
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+    Write-Host "Created folder: $OutputFolder" -ForegroundColor Cyan
+} else {
+    Write-Host "Using existing folder: $OutputFolder" -ForegroundColor Cyan
+}
+
+if ($AddDefenderExclusion) {
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Warning "Not running as Administrator - skipping Defender exclusion for $OutputFolder."
+    } else {
+        try {
+            if (Get-Command Add-MpPreference -ErrorAction SilentlyContinue) {
+                $existingExclusions = (Get-MpPreference).ExclusionPath
+                if ($existingExclusions -notcontains $OutputFolder) {
+                    Add-MpPreference -ExclusionPath $OutputFolder
+                    Write-Host "Added Windows Defender exclusion for: $OutputFolder" -ForegroundColor Cyan
+                } else {
+                    Write-Host "Windows Defender exclusion already set for: $OutputFolder" -ForegroundColor Cyan
+                }
+            } else {
+                Write-Warning "Add-MpPreference cmdlet not found - skipping exclusion step."
+            }
+        } catch {
+            Write-Warning "Failed to add Defender exclusion: $($_.Exception.Message)"
+        }
+    }
+}
+
+$total = $Files.Count
+$index = 0
+foreach ($file in $Files) {
+    $index++
+
+    # Resolve destination folder (subfolder if specified, else root)
+    if ($file.ContainsKey("SubFolder") -and $file.SubFolder) {
+        $destFolder = Join-Path $OutputFolder $file.SubFolder
+        if (-not (Test-Path -LiteralPath $destFolder)) {
+            New-Item -ItemType Directory -Path $destFolder -Force | Out-Null
+            Write-Host "Created subfolder: $destFolder" -ForegroundColor Cyan
+        }
+    } else {
+        $destFolder = $OutputFolder
+    }
+    $destPath = Join-Path $destFolder $file.Name
+
+    $overallPercent = [int](($index - 1) / $total * 100)
+    Write-Progress -Id 0 -Activity "Downloading tools" -Status "File $index of $total : $($file.Name)" -PercentComplete $overallPercent
+
+    if ((Test-Path -LiteralPath $destPath) -and -not $Overwrite) {
+        Write-Host "[$index/$total] SKIP (already exists): $destPath" -ForegroundColor Yellow
+        continue
+    }
+    try {
+        Write-Host "[$index/$total] Downloading $($file.Name) -> $destFolder ..."
+        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+            Start-BitsTransfer -Source $file.Url -Destination $destPath -Description $file.Name
+        } else {
+            $webClient = New-Object System.Net.WebClient
+            $eventId = "DownloadProgress_$index"
+            Register-ObjectEvent -InputObject $webClient -EventName DownloadProgressChanged -SourceIdentifier $eventId -Action {
+                $percent = $EventArgs.ProgressPercentage
+                Write-Progress -Id 1 -ParentId 0 -Activity "Downloading $($Event.MessageData)" -Status "$percent% complete" -PercentComplete $percent
+            } -MessageData $file.Name | Out-Null
+            $webClient.DownloadFileTaskAsync($file.Url, $destPath).Wait()
+            Unregister-Event -SourceIdentifier $eventId
+            $webClient.Dispose()
+            Write-Progress -Id 1 -ParentId 0 -Activity "Downloading $($file.Name)" -Completed
+        }
+        Write-Host "[$index/$total] DONE: $destPath" -ForegroundColor Green
+    } catch {
+        Write-Warning "[$index/$total] FAILED: $($file.Name) - $($_.Exception.Message)"
+    }
+}
+Write-Progress -Id 0 -Activity "Downloading tools" -Completed
+Write-Host "`nAll done. Files saved to $OutputFolder" -ForegroundColor Cyan
