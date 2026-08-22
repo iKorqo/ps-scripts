@@ -1,0 +1,301 @@
+#Requires -RunAsAdministrator
+<#
+.DESCRIPTION
+    DFIR Service Checker - Checks critical Windows services across multiple sources
+    and flags potential tampering indicators.
+
+.NOTES
+    Run in an elevated PowerShell session.
+    Clears the console and displays results only.
+#>
+
+# Service names in Windows-standard capitalization
+$ServiceNames = @(
+    "SysMain",
+    "PcaSvc",
+    "DPS",
+    "EventLog",
+    "DcomLaunch",
+    "bam",
+    "Schedule",
+    "DiagTrack",
+    "DusmSvc",
+    "dam",
+    "WSearch"
+)
+
+# Critical services that should not be Disabled
+$CriticalServices = @("EventLog", "DcomLaunch", "Schedule")
+
+# User-writable / suspicious path patterns
+$SuspiciousPaths = @(
+    "\Temp\",
+    "\Downloads\",
+    "\AppData\",
+    "\Public\",
+    "\Desktop\",
+    "\Documents\"
+)
+
+$SuspiciousExtensions = @(".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".hta")
+
+# Standard legitimate directories
+$StandardDirs = @(
+    "$env:SystemRoot",
+    "${env:ProgramFiles}",
+    "${env:ProgramFiles(x86)}"
+)
+
+# Resolve CDPUserSvc wildcard (first match)
+$cdpMatch = Get-Service -Name "CDPUserSvc_*" -ErrorAction SilentlyContinue | Select-Object -First 1
+$cdpActualName = $null
+if ($cdpMatch) {
+    $cdpActualName = $cdpMatch.Name
+}
+
+# Get boot time for comparison
+$BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+
+# Cache CIM services
+$CimServices = Get-CimInstance Win32_Service
+
+# Cache live processes
+$LiveProcesses = Get-Process | Select-Object Id, StartTime
+
+# Results collection
+$Results = @()
+
+function Resolve-ServiceBinaryPath {
+    param([string]$RawPath)
+    if (-not $RawPath) { return "" }
+    
+    $tempPath = $RawPath.Trim('"')
+    
+    # Extract just the executable portion
+    if ($tempPath -match '^"([^"]+)"') {
+        $BinaryPath = $Matches[1]
+    } elseif ($tempPath -match '^(\\?[^\s]+\.exe)') {
+        $BinaryPath = $Matches[1]
+    } elseif ($tempPath -match '^(\\?[^\s]+)') {
+        $BinaryPath = $Matches[1]
+    } else {
+        $BinaryPath = $tempPath
+    }
+    
+    # Resolve relative paths against %SystemRoot%
+    if ($BinaryPath -and -not ($BinaryPath -match '^[A-Za-z]:') -and -not ($BinaryPath.StartsWith('\'))) {
+        $BinaryPath = Join-Path $env:SystemRoot $BinaryPath
+    }
+    
+    return $BinaryPath
+}
+
+function Check-Service {
+    param(
+        [string]$DisplayName,
+        [string]$QueryName
+    )
+
+    $CimService = $CimServices | Where-Object { $_.Name -eq $QueryName } | Select-Object -First 1
+    $ScmService = Get-Service -Name $QueryName -ErrorAction SilentlyContinue
+
+    # Registry lookup
+    $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$QueryName"
+    $RegKey = $null
+    $RegImagePath = $null
+    $RegStart = $null
+    $RegLastWrite = $null
+    try {
+        $RegKey = Get-Item $RegPath -ErrorAction Stop
+        $RegImagePath = $RegKey.GetValue("ImagePath")
+        $RegStart = $RegKey.GetValue("Start")
+        $RegLastWrite = $RegKey.LastWriteTime
+    } catch {
+        # Service not in registry
+    }
+
+    # Determine state
+    $State = "NOT FOUND"
+    $StartTimeStr = "N/A"
+    $Altered = $false
+    $IsRunning = $false
+    $ProcessStart = $null
+
+    # Check registry Type for drivers when CIM is missing
+    $regType = if ($RegKey) { $RegKey.GetValue("Type") } else { $null }
+    $isDriver = ($regType -eq 1 -or $regType -eq 2)
+
+    # Trust SCM first, then CIM
+    $scmRunning = ($ScmService -and $ScmService.Status -eq 'Running')
+    $cimRunning = ($CimService -and $CimService.State -eq 'Running')
+
+    if ($scmRunning -or $cimRunning) {
+        $IsRunning = $true
+        $State = "RUNNING"
+
+        # Try to get process start time from CIM PID
+        $pidValue = if ($CimService) { $CimService.ProcessId } else { 0 }
+        if ($pidValue -gt 0 -and -not $isDriver) {
+            $liveProc = $LiveProcesses | Where-Object { $_.Id -eq $pidValue } | Select-Object -First 1
+            if ($liveProc) {
+                $ProcessStart = $liveProc.StartTime
+                if ($ProcessStart) {
+                    $StartTimeStr = $ProcessStart.ToString("HH:mm:ss")
+                }
+            }
+        }
+        # Drivers and services with no live process still show RUNNING, just no start time
+    } elseif ($ScmService -or $CimService -or $RegKey) {
+        $State = "STOPPED"
+    }
+
+    # Altered detection (skip for NOT FOUND)
+    if ($State -ne "NOT FOUND") {
+        $Alerts = @()
+
+        $EffectiveImagePath = $RegImagePath
+        if (-not $EffectiveImagePath -and $CimService) {
+            $EffectiveImagePath = $CimService.PathName
+        }
+
+        $BinaryPath = Resolve-ServiceBinaryPath -RawPath $EffectiveImagePath
+        $CleanPath = $BinaryPath
+
+        # 1. Suspicious path or extension
+        if ($CleanPath) {
+            $lowerPath = $CleanPath.ToLower()
+            foreach ($bad in $SuspiciousPaths) {
+                if ($lowerPath -like "*$bad*") {
+                    $Alerts += "SuspiciousPath"
+                    break
+                }
+            }
+            foreach ($ext in $SuspiciousExtensions) {
+                if ($lowerPath.EndsWith($ext)) {
+                    $Alerts += "SuspiciousExt"
+                    break
+                }
+            }
+        }
+
+        # 2. Outside standard directories (svchost exempted)
+        if ($CleanPath) {
+            $isSvchost = $CleanPath.ToLower().EndsWith("svchost.exe")
+            if (-not $isSvchost) {
+                $inStandard = $false
+                foreach ($std in $StandardDirs) {
+                    if ($CleanPath.ToLower().StartsWith($std.ToLower())) {
+                        $inStandard = $true
+                        break
+                    }
+                }
+                if (-not $inStandard) {
+                    $Alerts += "NonStandardDir"
+                }
+            }
+        }
+
+        # 3. Registry modified since boot (0 grace period)
+        if ($RegLastWrite -and $RegLastWrite -gt $BootTime) {
+            $Alerts += "RegModifiedSinceBoot"
+        }
+
+        # 4. Critical service disabled
+        $effectiveStart = $RegStart
+        if ($null -eq $effectiveStart -and $CimService) {
+            $effectiveStart = switch ($CimService.StartMode) {
+                "Auto" { 2 }
+                "Manual" { 3 }
+                "Disabled" { 4 }
+                default { $null }
+            }
+        }
+        if ($DisplayName -in $CriticalServices -and $effectiveStart -eq 4) {
+            $Alerts += "CriticalDisabled"
+        }
+
+        # 5. Signature check (store result for false-positive filtering)
+        $IsMicrosoftSigned = $false
+        if ($BinaryPath -and (Test-Path $BinaryPath)) {
+            try {
+                $sig = Get-AuthenticodeSignature -FilePath $BinaryPath -ErrorAction Stop
+                if ($sig.Status -eq "Valid") {
+                    $signer = $sig.SignerCertificate.Subject
+                    if ($signer -match "Microsoft" -or $signer -match "Windows") {
+                        $IsMicrosoftSigned = $true
+                    }
+                }
+                if (-not $IsMicrosoftSigned) {
+                    $Alerts += "BadSignature"
+                }
+            } catch {
+                # Skip if inaccessible
+            }
+        }
+
+        # 6. Filter false positive: RegModifiedSinceBoot alone on clean Microsoft-signed service in standard dir
+        if ($Alerts.Count -eq 1 -and $Alerts[0] -eq "RegModifiedSinceBoot") {
+            $inStandard = $false
+            if ($CleanPath) {
+                foreach ($std in $StandardDirs) {
+                    if ($CleanPath.ToLower().StartsWith($std.ToLower())) {
+                        $inStandard = $true
+                        break
+                    }
+                }
+            }
+            if ($inStandard -and $IsMicrosoftSigned) {
+                $Alerts = @()
+            }
+        }
+
+        if ($Alerts.Count -gt 0) {
+            $Altered = $true
+        }
+    }
+
+    return [PSCustomObject]@{
+        Name       = $DisplayName
+        State      = $State
+        Started    = $StartTimeStr
+        Altered    = $Altered
+    }
+}
+
+# Check all standard services
+foreach ($svcName in $ServiceNames) {
+    $Results += Check-Service -DisplayName $svcName -QueryName $svcName
+}
+
+# Check CDPUserSvc with display name override
+if ($cdpActualName) {
+    $Results += Check-Service -DisplayName "CDPUserSvc" -QueryName $cdpActualName
+}
+
+# Clear console before output
+Clear-Host
+
+# Header
+Write-Host ""
+Write-Host "DFIR Service Checker" -ForegroundColor Cyan
+Write-Host "====================" -ForegroundColor Cyan
+Write-Host "Boot Time: $($BootTime.ToString("yyyy-MM-dd HH:mm:ss"))" -ForegroundColor DarkGray
+Write-Host ""
+
+# Print results - entire line colored
+foreach ($r in $Results) {
+    $line = "{0,-12} {1,-9} Started: {2,-8}" -f $r.Name, $r.State, $r.Started
+
+    if ($r.Altered) {
+        Write-Host $line -ForegroundColor Yellow
+    } else {
+        switch ($r.State) {
+            "RUNNING"   { Write-Host $line -ForegroundColor Green }
+            "STOPPED"   { Write-Host $line -ForegroundColor Red }
+            "NOT FOUND" { Write-Host $line -ForegroundColor DarkGray }
+            default     { Write-Host $line }
+        }
+    }
+}
+
+Write-Host ""
